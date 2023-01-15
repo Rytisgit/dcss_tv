@@ -6,3 +6,4 @@ IO::Pty::Easy
 Tie::Cache
 Bot::BasicBot
 Net::WebSocket::Server
+IPC::Shareable

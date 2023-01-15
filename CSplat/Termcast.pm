@@ -16,6 +16,9 @@ use IO::Socket::INET;
 use Carp;
 use Fcntl qw/SEEK_SET/;
 use Data::Dumper;
+use Term::VT102;
+use Net::WebSocket::Server;
+use IPC::Shareable;
 
 my %COLOR_NUMBER = (
   black => 0,
@@ -62,17 +65,92 @@ sub read_password {
   $text
 }
 
+sub serialize_terminal {
+    my $self = shift;
+
+    my @ttyrecFrame = ();
+    # Read the whole screen line by line
+    for my $row (1 .. $self->{vt}->rows) {
+        my $line = $self->{vt}->row_plaintext($row);
+        if(!defined($line)){$
+            line = (' ') x 80;
+        }
+        my $rowattr = $self->{vt}->row_attr($row);
+        my @ints = unpack("S*", $rowattr);
+        if(!@ints){
+            splice(@ints, 0, 80, (7) x 80);
+        }
+        my @chars = split(//, $line);
+        my @objects = map { { chr => $chars[$_], attr => $ints[$_] } } 0..$#chars;
+        push @ttyrecFrame, @objects;
+    }   
+
+    sub to_string{
+        my $object = shift;
+        my $paddedAttr = sprintf("%03s", $object->{attr});
+        return $object->{chr} . $paddedAttr;
+    }
+
+    my $serializedString = join('', map { to_string($_) } @ttyrecFrame);
+    $self->{serializedTerminal} = $serializedString;
+}
+
 sub new {
   my ($class, @misc) = @_;
   my $self = { @misc };
 
-  $self->{host} ||= $TERMCAST_HOST;
-  $self->{port} ||= 31337;
+  tie $self->{changeCounter}, "IPC::Shareable", "my_shared_change_counter", { create => 'yes', exclusive => 0 } or die;
+  tie $self->{serializedTerminal}, "IPC::Shareable", "my_shared_serialized_terminal", { create => 'yes', exclusive => 0 } or die;
+  $self->{changeCounter} = 0;
+  my $pid = fork;
 
-  unless ($self->{local}) {
-    $self->{pass} = read_password($self->{passfile}) if $self->{passfile};
-    carp("Need channel name (name) and password (pass)\n")
+  if ($pid) {
+    # Parent process
+    
+    $SIG{INT} = $SIG{TERM} = sub {
+    # Send a SIGTERM signal to the child process
+      print STDERR "kill!";
+      if (kill 0, $pid) {
+      kill 'SIGTERM', $pid;
+      }
+      exit;
+    };
+    
+    $self->{vt} = new Term::VT102;
+    $self->{host} ||= $TERMCAST_HOST;
+    $self->{port} ||= 31337;
+
+    unless ($self->{local}) {
+      $self->{pass} = read_password($self->{passfile}) if $self->{passfile};
+      carp("Need channel name (name) and password (pass)\n")
       unless $self->{name} && $self->{pass};
+  }
+  } else {
+    # Child process
+    print STDERR "tying to child process\n";
+    tie $self->{serializedTerminal},"IPC::Shareable", "my_shared_serialized_terminal", { create => 0, exclusive => 0 } or die;
+    tie $self->{changeCounter}, "IPC::Shareable", "my_shared_change_counter", { create => 0, exclusive => 0 } or die;
+    my $previousChange = 0;
+    my $server = Net::WebSocket::Server->new(
+    listen => 8080,
+    tick_period => 0.001,
+    on_tick => sub {
+        my ($serv) = @_;
+        if($self->{changeCounter} != $previousChange){
+          $_->send_binary($self->{serializedTerminal}) for $serv->connections;
+          $previousChange = $self->{changeCounter};
+        }
+    },
+    );
+
+    $SIG{TERM} = sub {
+      print STDERR "it's over\n";
+      # Shut down the server when receiving SIGTERM
+      $server->shutdown;
+      
+    };
+
+    $server->start();
   }
 
   bless $self, $class;
@@ -211,6 +289,10 @@ sub write {
   my $SOCK = $self->{SOCK};
   for my $text (@_) {
     print $SOCK $text;
+    $self->{serializedTerminal} = $text;
+    $self->{changeCounter}++;
+    # $self->{vt}->process($text);
+    # $self->serialize_terminal();
   }
 
   if ($errored) {
