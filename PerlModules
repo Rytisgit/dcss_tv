@@ -5,3 +5,4 @@ Term::VT102
 IO::Pty::Easy
 Tie::Cache
 Bot::BasicBot
+Net::WebSocket::Server
