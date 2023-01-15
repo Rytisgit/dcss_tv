@@ -76,6 +76,7 @@ sub serialize_terminal {
             line = (' ') x 80;
         }
         my $rowattr = $self->{vt}->row_attr($row);
+
         my @ints = unpack("S*", $rowattr);
         if(!@ints){
             splice(@ints, 0, 80, (7) x 80);
@@ -99,9 +100,8 @@ sub new {
   my ($class, @misc) = @_;
   my $self = { @misc };
 
-  tie $self->{changeCounter}, "IPC::Shareable", "my_shared_change_counter", { create => 'yes', exclusive => 0 } or die;
   tie $self->{serializedTerminal}, "IPC::Shareable", "my_shared_serialized_terminal", { create => 'yes', exclusive => 0 } or die;
-  $self->{changeCounter} = 0;
+  
   my $pid = fork;
 
   if ($pid) {
@@ -129,26 +129,21 @@ sub new {
     # Child process
     print STDERR "tying to child process\n";
     tie $self->{serializedTerminal},"IPC::Shareable", "my_shared_serialized_terminal", { create => 0, exclusive => 0 } or die;
-    tie $self->{changeCounter}, "IPC::Shareable", "my_shared_change_counter", { create => 0, exclusive => 0 } or die;
-    my $previousChange = 0;
     my $server = Net::WebSocket::Server->new(
     listen => 8080,
-    tick_period => 0.001,
+    tick_period => 0.05,
     on_tick => sub {
         my ($serv) = @_;
-        if($self->{changeCounter} != $previousChange){
-          $_->send_binary($self->{serializedTerminal}) for $serv->connections;
-          $previousChange = $self->{changeCounter};
-        }
+        $_->send_utf8($self->{serializedTerminal}) for $serv->connections;
     },
     );
 
-    $SIG{TERM} = sub {
-      print STDERR "it's over\n";
-      # Shut down the server when receiving SIGTERM
-      $server->shutdown;
+    # $SIG{TERM} = sub {
+    #   print STDERR "it's over\n";
+    #   # Shut down the server when receiving SIGTERM
+    #   $server->shutdown;
       
-    };
+    # };
 
     $server->start();
   }
@@ -289,10 +284,8 @@ sub write {
   my $SOCK = $self->{SOCK};
   for my $text (@_) {
     print $SOCK $text;
-    $self->{serializedTerminal} = $text;
-    $self->{changeCounter}++;
-    # $self->{vt}->process($text);
-    # $self->serialize_terminal();
+    $self->{vt}->process($text);
+    $self->serialize_terminal();
   }
 
   if ($errored) {
